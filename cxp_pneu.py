@@ -12,7 +12,6 @@ import wandb
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 import torchvision
 import torchvision.transforms.v2 as transforms
@@ -163,9 +162,7 @@ def train_and_eval(data_dir, csv_dir, out_dir):
     ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.9), use_buffers=True)
     
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=0.005)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=NUM_EPOCHS, eta_min=10e-6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.005)
 
     train_auroc = BinaryAUROC()
     val_auroc = BinaryAUROC()
