@@ -2,6 +2,7 @@
 # - multiple runs, showing mean +/- std results
 # - uses balanced val set
 # - optional train set balancing
+# - StratifiedShortcutSampler for conflict mining
 
 import os
 import os.path
@@ -56,7 +57,7 @@ def setup_logging(root_dir):
     sys.excepthook = exception_handler    
 
 
-def setup_wandb(root_dir, balance_train, balance_val, select_chkpt_on):
+def setup_wandb(root_dir, balance_train, balance_val, select_chkpt_on, use_stratified):
 
     wandb_dir = root_dir / "wandb"
     wandb_dir.mkdir(exist_ok=True)
@@ -72,9 +73,93 @@ def setup_wandb(root_dir, balance_train, balance_val, select_chkpt_on):
         "balance_train": balance_train,
         "balance_val": balance_val,
         "select_chkpt_on": select_chkpt_on,
+        "use_stratified_sampler": use_stratified,
         "loss": "BCE"
         }
     )       
+
+
+class StratifiedShortcutSampler(torch.utils.data.Sampler):
+    """
+    A Sampler that yields batches of indices, ensuring each batch has an equal
+    number of samples from the four "shortcut" groups (P=1/D=1, P=1/D=0, P=0/D=1, P=0/D=0).
+    
+    This is essential for "conflict" mining, as it guarantees that
+    conflict-causing samples are present in each batch.
+    """
+    def __init__(self, p_labels, d_labels, batch_size):
+        super().__init__(None) # We don't need a data_source, just the labels
+        
+        self.p_labels = p_labels
+        self.d_labels = d_labels
+        
+        # We need a batch size that is divisible by 4
+        assert batch_size % 4 == 0, f"Batch size must be divisible by 4, but got {batch_size}"
+        self.batch_size = batch_size
+        self.samples_per_group = batch_size // 4
+        # 1. Create four lists of indices, one for each group
+        self.group_indices = [[] for _ in range(4)]
+        for i, (p, d) in enumerate(zip(p_labels, d_labels)):
+            if p == 1 and d == 1:
+                self.group_indices[0].append(i) # G1 (P=1, D=1)
+            elif p == 1 and d == 0:
+                self.group_indices[1].append(i) # G2 (P=1, D=0)
+            elif p == 0 and d == 1:
+                self.group_indices[2].append(i) # G3 (P=0, D=1)
+            else:
+                self.group_indices[3].append(i) # G4 (P=0, D=0)
+        
+        # 2. Determine how many batches we can make
+        # This will be limited by the smallest group
+        self.min_group_size = min(len(g) for g in self.group_indices)
+        self.num_batches = self.min_group_size // self.samples_per_group
+        
+        # 3. This is the total number of samples that will be yielded per epoch
+        self.num_samples = self.num_batches * self.batch_size
+        
+        logging.info(f"StratifiedSampler: Group sizes - G0(P=1,D=1): {len(self.group_indices[0])}, "
+                    f"G1(P=1,D=0): {len(self.group_indices[1])}, "
+                    f"G2(P=0,D=1): {len(self.group_indices[2])}, "
+                    f"G3(P=0,D=0): {len(self.group_indices[3])}")
+        logging.info(f"StratifiedSampler: Min group size: {self.min_group_size}")
+        logging.info(f"StratifiedSampler: Samples per group/batch: {self.samples_per_group}")
+        logging.info(f"StratifiedSampler: Num batches per epoch: {self.num_batches}")
+        logging.info(f"StratifiedSampler: Total samples per epoch: {self.num_samples}")
+        
+    def __iter__(self):
+        # 1. Shuffle the indices within each group
+        #    This ensures we get different batches each epoch
+        g0_shuffled = torch.randperm(len(self.group_indices[0])).tolist()
+        g1_shuffled = torch.randperm(len(self.group_indices[1])).tolist()
+        g2_shuffled = torch.randperm(len(self.group_indices[2])).tolist()
+        g3_shuffled = torch.randperm(len(self.group_indices[3])).tolist()
+        # 2. Create the list of batches
+        batches = []
+        for i in range(self.num_batches):
+            batch = []
+            
+            # Get the start/end indices for this batch
+            start = i * self.samples_per_group
+            end = (i + 1) * self.samples_per_group
+            
+            # Pull samples from each group
+            batch.extend([self.group_indices[0][g0_shuffled[j]] for j in range(start, end)])
+            batch.extend([self.group_indices[1][g1_shuffled[j]] for j in range(start, end)])
+            batch.extend([self.group_indices[2][g2_shuffled[j]] for j in range(start, end)])
+            batch.extend([self.group_indices[3][g3_shuffled[j]] for j in range(start, end)])
+            
+            batches.append(batch)
+            
+        # 3. Shuffle the order of the batches themselves
+        np.random.shuffle(batches)
+        
+        # 4. Flatten the list of batches into a single list of indices
+        final_indices = [idx for batch in batches for idx in batch]
+        
+        return iter(final_indices)
+        
+    def __len__(self):
+        return self.num_samples
 
 
 class CXP_Model(nn.Module):
@@ -170,7 +255,8 @@ class CXP_dataset(torchvision.datasets.VisionDataset):
     def __len__(self) -> int:
         return len(self.path)
 
-def train_and_eval(data_dir, csv_dir, out_dir, balance_train_set=False, balance_val_set=False, select_chkpt_on="loss"):
+def train_and_eval(data_dir, csv_dir, out_dir, balance_train_set=False, balance_val_set=False, 
+                   select_chkpt_on="loss", use_stratified_sampler=False):
     if balance_val_set:
         train_data = CXP_dataset(data_dir, csv_dir / 'train_drain_shortcut_v2.csv')
         val_data = CXP_dataset(data_dir, csv_dir / 'val_drain_shortcut_v2.csv', augment=False)
@@ -180,7 +266,22 @@ def train_and_eval(data_dir, csv_dir, out_dir, balance_train_set=False, balance_
     test_data_aligned = CXP_dataset(data_dir, csv_dir / 'test_drain_shortcut_aligned.csv', augment=False)
     test_data_misaligned = CXP_dataset(data_dir, csv_dir / 'test_drain_shortcut_misaligned.csv', augment=False)
     
-    if balance_train_set:
+    # Determine which sampler to use
+    sampler = None
+    shuffle = True
+    
+    if use_stratified_sampler:
+        # Use StratifiedShortcutSampler for conflict mining
+        logging.info("Using StratifiedShortcutSampler for training")
+        sampler = StratifiedShortcutSampler(
+            p_labels=train_data.labels.values,
+            d_labels=train_data.drain.values,
+            batch_size=64
+        )
+        shuffle = False  # Don't shuffle when using a custom sampler
+    elif balance_train_set:
+        # Use WeightedRandomSampler for class balancing
+        logging.info("Using WeightedRandomSampler for training")
         pneu_msk = train_data.labels==1
         drain_counts_pneu = torch.bincount(torch.from_numpy(train_data.drain[pneu_msk].values))
         drain_weights_pneu = 1.0 / drain_counts_pneu.float()
@@ -194,9 +295,19 @@ def train_and_eval(data_dir, csv_dir, out_dir, balance_train_set=False, balance_
         logging.info(f'No Pneu weights: {drain_weights_nopneu}')
 
         sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+        shuffle = False
+    else:
+        logging.info("Using standard random shuffling for training")
 
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=64, shuffle=True if not balance_train_set else False, num_workers=12, pin_memory=True, prefetch_factor=2,
-                                               sampler=None if not balance_train_set else sampler)
+    train_loader = torch.utils.data.DataLoader(
+        train_data, 
+        batch_size=64, 
+        shuffle=shuffle, 
+        num_workers=12, 
+        pin_memory=True, 
+        prefetch_factor=2,
+        sampler=sampler
+    )
     val_loader = torch.utils.data.DataLoader(val_data, batch_size=64, shuffle=True, num_workers=12, pin_memory=True, prefetch_factor=2)
     test_loader_aligned = torch.utils.data.DataLoader(test_data_aligned, batch_size=64, shuffle=False, num_workers=12, pin_memory=True, prefetch_factor=2)      
     test_loader_misaligned = torch.utils.data.DataLoader(test_data_misaligned, batch_size=64, shuffle=False, num_workers=12, pin_memory=True, prefetch_factor=2)      
@@ -404,8 +515,15 @@ if __name__ == '__main__':
                        default=False)                 
     parser.add_argument('--select_chkpt_on', type=str, required=False,
                        help='Val metric to select final chkpt on. Possible values right now: AUROC, Loss.',
-                       default="loss")                                 
+                       default="loss")
+    parser.add_argument('--use_stratified_sampler', type=lambda x: x.lower() == 'true', required=False,
+                       help='Whether to use StratifiedShortcutSampler for conflict mining (mutually exclusive with balance_train)',
+                       default=False)                                 
     args = parser.parse_args()
+    
+    # Validate arguments
+    if args.balance_train and args.use_stratified_sampler:
+        raise ValueError("Cannot use both balance_train and use_stratified_sampler simultaneously. Choose one.")
     
     data_dir = Path(args.data_dir)
     csv_dir = Path(args.csv_dir)
@@ -418,7 +536,9 @@ if __name__ == '__main__':
     else:
         logging.info("Using CPU")
 
-    if args.balance_train:
+    if args.use_stratified_sampler:
+        logging.info("Using StratifiedShortcutSampler for conflict mining")
+    elif args.balance_train:
         logging.info("Using train set balancing")
     else:
         logging.info("Using native train distribution = no balancing")
@@ -427,11 +547,12 @@ if __name__ == '__main__':
     
     results = []
     for _ in range(NUM_RUNS):
-        setup_wandb(out_dir, args.balance_train, args.balance_val, args.select_chkpt_on) 
+        setup_wandb(out_dir, args.balance_train, args.balance_val, args.select_chkpt_on, args.use_stratified_sampler) 
         results.append(train_and_eval(data_dir, csv_dir, out_dir, 
                                       balance_train_set=args.balance_train,
                                       balance_val_set=args.balance_val,
-                                      select_chkpt_on=args.select_chkpt_on))
+                                      select_chkpt_on=args.select_chkpt_on,
+                                      use_stratified_sampler=args.use_stratified_sampler))
         wandb.finish()
 
     logging.info("===== FINAL RESULTS ACROSS RUNS =====")
